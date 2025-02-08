@@ -180,4 +180,6 @@ RunService.RenderStepped:Connect(function()
 	end
 end)
 
-return SpatialSoundSystem
+return {
+	SpatialSoundSystem = SpatialSoundSystem,
+}

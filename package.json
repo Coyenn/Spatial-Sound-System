@@ -1,6 +1,6 @@
 {
   "name": "@pixelpirates/spatial-sound-system",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "TypeScript port of Boatbomber's 3D-Sound-Emulation module",
   "main": "src",
   "types": "src/types/index.d.ts",
