@@ -2,26 +2,27 @@
 local RunService = game:GetService("RunService")
 local SoundService = game:GetService("SoundService")
 
+-- Client-side validation
 if not RunService:IsClient() then
-	error("Sound System Spatial is to be run on the client. Use RemoteEvents to have the client create the sound.")
+	error("SoundSystemSpatial must run on client. Use RemoteEvents to trigger client-side sound creation.")
 end
 
--- Localize maths for optimization
+-- Math utilities
+local mathAbs = math.abs
 local acos, cos, pi = math.acos, math.cos, math.pi
-local atan2, deg = math.atan2, math.deg
 local v3, cf = Vector3.new, CFrame.new
 local dot = v3().Dot
-local newInst, getType = Instance.new, typeof
 
 -- Camera setup
 local Camera = workspace.CurrentCamera
 local FoV = Camera.FieldOfView
+
 Camera:GetPropertyChangedSignal("FieldOfView"):Connect(function()
 	FoV = Camera.FieldOfView
 end)
 
--- Create container object
-local SoundContainer = newInst("Part")
+-- Sound container setup
+local SoundContainer = Instance.new("Part")
 SoundContainer.Name = "SoundContainer"
 SoundContainer.CFrame = cf()
 SoundContainer.Anchored = true
@@ -29,176 +30,154 @@ SoundContainer.CanCollide = false
 SoundContainer.Transparency = 1
 SoundContainer.Parent = Camera
 
--- Setup system
-local SoundSystem = {}
+-- System core
+local SpatialSoundSystem = {}
 local CurrentObjects = {}
 
-function SoundSystem:Attach(SoundObj)
-	--------------------------
-	-- Sanity checks
-	--------------------------
+--[[
+	Attaches an existing Sound object to the spatial audio system
+	@param SoundObj: Sound instance parented to BasePart/Attachment in workspace
+]]
+function SpatialSoundSystem:Attach(SoundObj)
+	-- Region: Validation
+	do
+		assert(
+			typeof(SoundObj) == "Instance" and SoundObj.ClassName == "Sound",
+			"Invalid Sound object (expected Sound instance)"
+		)
 
-	assert(typeof(SoundObj) == "Instance" and SoundObj.ClassName == "Sound", "Attempt to attach invalid Sound object.")
-	assert(
-		SoundObj.Parent
-			and (SoundObj.Parent:IsA("Attachment") or SoundObj.Parent:IsA("BasePart"))
-			and SoundObj:IsDescendantOf(workspace),
-		"Cannot have Spatial effect on sound that is not in Spatial environment"
-	)
+		assert(SoundObj.Parent and SoundObj:IsDescendantOf(workspace), "Sound must be in workspace hierarchy")
 
-	--------------------------
-	-- Object creation
-	--------------------------
+		assert(
+			SoundObj.Parent:IsA("Attachment") or SoundObj.Parent:IsA("BasePart"),
+			"Sound parent must be BasePart or Attachment"
+		)
+	end
 
-	local Equalizer = newInst("EqualizerSoundEffect") -- Create a separate one to ensure it doesn't mess with any existing effects
+	-- Region: Equalizer setup
+	local Equalizer = Instance.new("EqualizerSoundEffect")
 	Equalizer.LowGain = 0
 	Equalizer.MidGain = 0
 	Equalizer.HighGain = 0
-
-	--------------------------
-	-- Effect controller
-	--------------------------
-
-	local isAttachment = SoundObj.Parent:IsA("Attachment")
-
-	local Emitter =
-		{ Sound = SoundObj, Position = isAttachment and SoundObj.Parent.WorldPosition or SoundObj.Parent.Position }
-
-	local PositionTracker = SoundObj.Parent:GetPropertyChangedSignal("Position"):Connect(function()
-		Emitter.Position = isAttachment and SoundObj.Parent.WorldPosition or SoundObj.Parent.Position
-	end)
-
-	CurrentObjects[Emitter] = true
-
-	--------------------------
-	-- Finalization
-	--------------------------
-
 	Equalizer.Parent = SoundObj
 
-	SoundObj.AncestryChanged:Connect(function(_, Parent)
-		if not Parent then
-			--Destroyed
-			CurrentObjects[Emitter] = nil
-		elseif
+	-- Region: Position tracking
+	local isAttachment = SoundObj.Parent:IsA("Attachment")
+	local emitterPosition = isAttachment and SoundObj.Parent.WorldPosition or SoundObj.Parent.Position
+
+	local PositionTracker = SoundObj.Parent:GetPropertyChangedSignal("Position"):Connect(function()
+		emitterPosition = isAttachment and SoundObj.Parent.WorldPosition or SoundObj.Parent.Position
+	end)
+
+	CurrentObjects[SoundObj] = emitterPosition
+
+	-- Region: Lifetime management
+	SoundObj.AncestryChanged:Connect(function(_, newParent)
+		if not newParent then
+			CurrentObjects[SoundObj] = nil
+			return
+		end
+
+		if
 			(SoundObj.Parent:IsA("Attachment") or SoundObj.Parent:IsA("BasePart"))
 			and SoundObj:IsDescendantOf(workspace)
 		then
-			--Moved
-			CurrentObjects[Emitter] = true
-
 			PositionTracker:Disconnect()
 			PositionTracker = SoundObj.Parent:GetPropertyChangedSignal("Position"):Connect(function()
-				Emitter.Position = isAttachment and SoundObj.Parent.WorldPosition or SoundObj.Parent.Position
+				emitterPosition = isAttachment and SoundObj.Parent.WorldPosition or SoundObj.Parent.Position
 			end)
 		else
-			--Moved to invalid object
-			CurrentObjects[Emitter] = nil
+			CurrentObjects[SoundObj] = nil
 		end
 	end)
 end
 
-function SoundSystem:Create(ID, Target, Looped)
-	local TargetType
+--[[
+	Creates a new spatial sound emitter
+	@param ID: Sound asset ID (numeric string)
+	@param Target: Position/CFrame/BasePart/Attachment to follow
+	@param Looped: Whether to loop the sound (default: false)
+	@returns Created Attachment containing the sound
+]]
+function SpatialSoundSystem:Create(ID, Target, Looped)
+	-- Region: Input validation
+	local targetType = typeof(Target)
 
-	--------------------------
-	-- Sanity checks
-	--------------------------
+	assert(
+		type(ID) == "string" and ID:match("^%d+$"),
+		string.format("Invalid sound ID: %s (expected numeric string)", ID)
+	)
 
-	if not ID or getType(ID) ~= "string" or not ID:match("%d+") then -- Must exist, be a string, and have numbers
-		error("Invalid ID: " .. tostring(ID))
-	end
-	if Target then -- Must exist
-		TargetType = getType(Target)
-		if TargetType ~= "Instance" and TargetType ~= "Vector3" and TargetType ~= "CFrame" then -- Must be valid type
-			error("Invalid Target: " .. tostring(Target))
-		end
-	else
-		error("Invalid Target: " .. tostring(Target))
-	end
-	Looped = Looped or false
+	assert(
+		targetType == "Vector3" or targetType == "CFrame" or (targetType == "Instance" and Target:IsA("BasePart")),
+		"Invalid target type: " .. tostring(targetType)
+	)
 
-	--------------------------
-	-- Object creation
-	--------------------------
+	-- Region: Emitter setup
+	local Emitter = Instance.new("Attachment")
+	local shouldLoop = Looped or false
 
-	local Emitter = newInst("Attachment")
-	--Emitter.Visible	= true
-
-	if TargetType == "Instance" and Target.Position then
-		-- Sound follows object
+	-- Position tracking
+	if targetType == "Instance" then
 		RunService.RenderStepped:Connect(function()
 			Emitter.WorldPosition = Target.Position
 		end)
-	elseif TargetType == "Vector3" then
-		-- Sound in static position
+	elseif targetType == "Vector3" then
 		Emitter.WorldPosition = Target
-	elseif TargetType == "CFrame" then
-		-- Sound in static position
+	elseif targetType == "CFrame" then
 		Emitter.WorldPosition = Target.Position
 	end
 
-	local Sound = newInst("Sound")
-	Sound.Looped = Looped
+	-- Region: Sound creation
+	local Sound = Instance.new("Sound")
+	Sound.Looped = shouldLoop
 	Sound.SoundId = "rbxassetid://" .. ID:match("%d+")
 
-	local Equalizer = newInst("EqualizerSoundEffect")
+	local Equalizer = Instance.new("EqualizerSoundEffect")
 	Equalizer.LowGain = 0
 	Equalizer.MidGain = 0
 	Equalizer.HighGain = 0
+	Equalizer.Parent = Sound
 
-	--------------------------
-	-- Effect controller
-	--------------------------
-
+	-- Region: System registration
 	CurrentObjects[Emitter] = true
-	if not Looped then
+
+	if not shouldLoop then
 		Sound.Ended:Connect(function()
 			CurrentObjects[Emitter] = nil
 			Emitter:Destroy()
 		end)
 	end
 
-	--------------------------
-	-- Finalization
-	--------------------------
-
-	Equalizer.Parent = Sound
+	-- Region: Hierarchy setup
 	Sound.Parent = Emitter
 	Emitter.Parent = SoundContainer
-
 	Sound:Play()
 
 	return Emitter
 end
 
---------------------------
--- 3D-Effect management
---------------------------
-
+-- Region: Spatial processing
 RunService.RenderStepped:Connect(function()
 	local _, Listener = SoundService:GetListener()
+	local listenerCFrame = Listener and Listener:IsA("BasePart") and Listener.CFrame or Camera.CFrame
 
-	if Listener then
-		if Listener:IsA("BasePart") then
-			Listener = Listener.CFrame
-		end
-	else
-		Listener = Camera.CFrame
-	end
+	for Emitter in pairs(CurrentObjects) do
+		local soundPosition = Emitter.WorldPosition
+		local listenerPosition = listenerCFrame.Position
 
-	for Emitter, _ in pairs(CurrentObjects) do
-		local Facing = Listener.LookVector
-		local Vector = (Emitter.Position - Listener.Position).unit
+		-- Calculate directional vector (horizontal plane only)
+		local facing = listenerCFrame.LookVector * v3(1, 0, 1)
+		local direction = (soundPosition - listenerPosition).Unit * v3(1, 0, 1)
 
-		--Remove Y so up/down doesn't matter
-		Facing = v3(Facing.X, 0, Facing.Z)
-		Vector = v3(Vector.X, 0, Vector.Z)
+		-- Calculate attenuation angle
+		local dotProduct = mathAbs(dot(facing, direction))
+		local angle = acos(math.clamp(dotProduct, 0, 1)) -- Clamp for floating safety
 
-		local Angle = acos(dot(Facing, Vector) / (Facing.magnitude * Vector.magnitude))
-
-		Emitter.Sound.EqualizerSoundEffect.HighGain = -(25 * ((Angle / pi) ^ 2))
+		-- Apply high frequency attenuation
+		local attenuation = -25 * ((angle / pi) ^ 2)
+		Emitter.Sound.EqualizerSoundEffect.HighGain = attenuation
 	end
 end)
 
-return SoundSystem
+return SpatialSoundSystem
